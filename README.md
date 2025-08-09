@@ -77,6 +77,16 @@ EZCache<MaxSize, EnableStats>
 
 ---
 
+## Contributing
+
+Contributions are welcome.
+
+- Open a pull request to the `main` branch.
+- Keep your changes in a single commit (use `git rebase -i` if needed).
+- Your PR will be reviewed and, if approved, merged via rebase.
+
+---
+
 ## License
 
 
