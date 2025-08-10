@@ -15,6 +15,9 @@
 #include <optional>
 #include <shared_mutex>
 #include <type_traits>
+#include <atomic>
+#include <chrono>
+#include <mutex>
 
 #include "internal.hpp"
 
@@ -37,7 +40,12 @@ namespace ezcache {
 
 template <std::size_t MaxSize = 2048, bool EnableStats = false>
 class EZCache {
+
 public:
+    EZCache() {
+        _lru.reserve(MaxSize);
+    }
+
     template<typename Func, typename... Args>
     auto operator()(Func&& func, Args&&... args)
             -> std::decay_t<std::invoke_result_t<Func, Args...>> {
@@ -75,11 +83,15 @@ private:
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
+    static constexpr double LRU_CLEAR_RATE = 0.3;
+
     struct Entry {
         Value value{};
         ReturnType return_type = typeid(void);
+        Hash hash{};
+        std::atomic<uint64_t> last_use{};
         std::optional<TimePoint> expire_time{};
-        std::list<Hash>::iterator lru_iter{};
+        std::size_t lru_index{};
         std::optional<std::multimap<TimePoint, Hash>::iterator> expire_time_iter{};
     };
 
@@ -102,23 +114,27 @@ private:
 
     template<typename ReturnType, typename Duration>
     void _put_in_cache(const Hash key, const Value& value, std::optional<Duration> ttl = std::nullopt) {
-        std::lock_guard<std::mutex> unique_lock(_mutex);
+        std::unique_lock<std::shared_mutex> lock(_mutex);
         _clear_entry(key);
-        Entry entry{.value = value, .return_type = std::type_index(typeid(ReturnType))};
-        _lru.push_front(key);
-        entry.lru_iter = _lru.begin();
+        auto [it, inserted] = _cache.try_emplace(key);
+        auto& entry = it->second;
+        entry.value = value;
+        entry.hash = key;
+        entry.lru_index = _lru.size();
+        entry.return_type = std::type_index(typeid(ReturnType));
+        _lru.push_back(key);
         if (ttl.has_value()) {
             auto ttl_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(*ttl);
             entry.expire_time = Clock::now() + ttl_ns;
             entry.expire_time_iter = _expire_times.insert({*entry.expire_time, key});
         }
-        _cache[key] = entry;
+        entry.last_use.store(_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
         _clear_if_needed();
     }
 
     template<typename ReturnT>
     std::optional<ReturnT> _get_from_cache(const Hash key) {
-        std::lock_guard<std::mutex> unique_lock(_mutex);
+        std::shared_lock<std::shared_mutex> lock(_mutex);
         const auto entry_it = _cache.find(key);
         if (entry_it == _cache.end()) {
             return std::nullopt;
@@ -130,45 +146,90 @@ private:
             return std::nullopt;
         }
 
-        _prioritize_in_lru(entry.lru_iter);
+        entry.last_use.store(_epoch.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
         return std::any_cast<ReturnT>(entry.value);
-    }
-
-    void _prioritize_in_lru(const std::list<Hash>::iterator& lru_iter) {
-        _lru.splice(_lru.begin(), _lru, lru_iter);
     }
 
     void _clear_entry(const Hash key) {
         auto entry_it = _cache.find(key);
-        if (entry_it != _cache.end()) {
-            const auto& entry = entry_it->second;
-            if (entry.expire_time.has_value()) {
-                _expire_times.erase(entry.expire_time_iter.value());
+        if (entry_it == _cache.end()) {
+            return;
+        }
+        const auto& entry = entry_it->second;
+        if (!_lru.empty()) {
+            if (entry.hash != _lru.back()) {
+                _cache.at(_lru.back()).lru_index = entry.lru_index;
+                std::swap(_lru[entry.lru_index], _lru.back());
             }
-            _lru.erase(entry.lru_iter);
-            _cache.erase(entry_it);
+            _lru.pop_back();
+        }
+
+        if (entry.expire_time_iter.has_value()) {
+            _expire_times.erase(entry.expire_time_iter.value());
+        }
+        _cache.erase(entry_it);
+    }
+
+    void _clear_using_lru() {
+        if (_lru.empty()) {
+            return;
+        }
+        std::vector<Hash> temp_lru{_lru};
+        size_t element_count_to_drop = temp_lru.size() * LRU_CLEAR_RATE;
+        if (element_count_to_drop == 0) {
+            return;
+        }
+        const size_t element_count_to_preserve = temp_lru.size() - element_count_to_drop;
+        std::nth_element(temp_lru.begin(), temp_lru.begin() + element_count_to_preserve, temp_lru.end(),
+                [this](const auto& lhs, const auto& rhs) {
+                    return (this->_cache.at(lhs).last_use.load(std::memory_order_relaxed) >
+                            this->_cache.at(rhs).last_use.load(std::memory_order_relaxed) );
+                });
+        constexpr size_t MAX_BATCH = 1024;
+        const size_t todo = std::min(element_count_to_drop, MAX_BATCH);
+        for (size_t idx = 0; idx < todo; idx++) {
+            const auto key = temp_lru.back();
+            _clear_entry(key);
+            temp_lru.pop_back();
+        }
+    }
+
+    void _clear_using_expire_times() {
+        const TimePoint now = Clock::now();
+        while (!_expire_times.empty() && _expire_times.begin()->first <= now) {
+            auto time_it = _expire_times.begin();
+            const auto key = time_it->second;
+            auto entry_it = _cache.find(key);
+            if (entry_it == _cache.end()) {
+                _expire_times.erase(time_it);
+                continue;
+            }
+
+            const auto& entry = entry_it->second;
+            if (entry.expire_time_iter.has_value()
+                    && entry.expire_time_iter.value() == time_it) {
+                _clear_entry(key);
+            } else {
+                _expire_times.erase(time_it);
+            }
         }
     }
 
     void _clear_if_needed() {
         if (!_expire_times.empty()) {
-            const TimePoint now = Clock::now();
-            while (!_expire_times.empty() && _expire_times.begin()->first <= now) {
-                const auto key = _expire_times.begin()->second;
-                _clear_entry(key);
-            }
+            _clear_using_expire_times();
         }
 
-        while (_cache.size() >= MaxSize) {
-            const auto key = _lru.back();
-            _clear_entry(key);
+        if (_cache.size() >= MaxSize) {
+            _clear_using_lru();
         }
     }
 
     std::unordered_map<Hash, Entry> _cache;
-    std::list<Hash> _lru;
+    std::vector<Hash> _lru;
     std::multimap<TimePoint, Hash> _expire_times;
-    std::mutex _mutex;
+    std::shared_mutex _mutex;
+    std::atomic<uint64_t> _epoch{0};
     [[no_unique_address]] stats::CounterBase<EnableStats> _collision_counter{};
     [[no_unique_address]] stats::CounterBase<EnableStats> _hit_counter{};
     [[no_unique_address]] stats::CounterBase<EnableStats> _miss_counter{};

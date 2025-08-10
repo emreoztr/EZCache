@@ -105,11 +105,10 @@ void benchmark_cold_loop(std::size_t N) {
     volatile int sink = 0;
 
     for (std::size_t i = 0; i < N; ++i) {
-        // her seferinde farklı key -> zorunlu miss
         int key = static_cast<int>(1000000 + i);
 
         auto t0 = clock::now();
-        int r = cache(common_lambda, key); // miss + insert (ve gerekirse eviction)
+        int r = cache(common_lambda, key); // miss + insert
         auto t1 = clock::now();
         sink ^= r;
 
@@ -124,8 +123,8 @@ void benchmark_cold_loop(std::size_t N) {
 }
 
 int main() {
-    benchmark_hot();
     benchmark_cold();
+    benchmark_hot();
     benchmark_expire();
     benchmark_lru();
     benchmark_type_mismatch();
