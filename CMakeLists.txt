@@ -12,15 +12,11 @@ add_library(EZCache::EZCache ALIAS EZCache)
 target_include_directories(EZCache INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(EZCache INTERFACE cxx_std_20)
 
-# (İsteğe bağlı ama IDE için faydalı) Header'ı hedefe iliştir
-# target_sources(EZCache INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/EZCache.hpp)
-
 ### BENCHMARK ###
 option(EZCACHE_BUILD_BENCHMARK "Build EZCache benchmark" OFF)
 if (EZCACHE_BUILD_BENCHMARK AND (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR))
     add_executable(benchmark benchmark/benchmark.cpp)
     target_link_libraries(benchmark PRIVATE EZCache)
-    # Release’ta optimize
     if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(benchmark PRIVATE $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native>)
         target_link_options(benchmark PRIVATE $<$<CONFIG:Release>:-flto>)
